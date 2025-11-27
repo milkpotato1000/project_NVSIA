@@ -1,3 +1,33 @@
+import os
+import pandas as pd
+import numpy as np
+import re
+
+# llm
+from dotenv import load_dotenv
+from openai import OpenAI
+import json
+
+# db
+import psycopg2
+
+# tfidf
+from sklearn.feature_extraction.text import TfidfVectorizer
+from scipy.sparse import hstack
+import pickle
+
+# .env 파일 로드
+load_dotenv()  # 현재 디렉토리 내 .env 파일 정보를 환경변수로 읽어옴
+
+# 환경변수 확인
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise ValueError("OPENAI_API_KEY not found. .env 또는 시스템 환경변수에 설정하세요.")
+
+client = OpenAI(api_key=api_key)
+llm_model = "gpt-4o-mini"
+embed_model = "text-embedding-ada-002"
+
 class LLMtoDatabase:
 
     def __init__(self, host, database, user, password, port):
