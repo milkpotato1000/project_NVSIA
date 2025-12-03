@@ -13,7 +13,6 @@ import psycopg2
 
 # tfidf
 from sklearn.feature_extraction.text import TfidfVectorizer
-from scipy.sparse import hstack
 import pickle
 
 # .env 파일 로드
@@ -30,17 +29,42 @@ embed_model = "text-embedding-ada-002"
 
 class LLMtoDatabase:
 
-    def __init__(self, host, database, user, password, port):
+    def __init__(self, host, database, user, password, port, tfidf_vectorizer_path, svm_model_path, label_encoder_path):
         """
 
         CSV(title, contents, publish_date, url) 파일을 받아 LLM 요약.
-        LLM output을 Postgre DB table에 저장.
+        LLM ouput Postgre DB table에 저장.
+
+        [수정 2025-11-27]
+        1) CSV(title, contents, publish_date, url) 파일을 input으로 받음.
+        2) LLM summary, keywords 등등 출력.
+        3) summary, keywords TF-IDF 변환 > SVM > 카테고리 분류.
+        4) ADA embedding 진행 > db 저장. (postgres에서 l2 norm 진행)
+        5) Postgre DB table에 저장.
+
+        [수정 2025-12-03]
+        매개변수 tfidf_vectorizer_path, svm_model_path, label_encoder_path 추가.
+        '시', '도' 변환 코드 merge.
 
         """
+
+        # 모델 정의
+        self.llm_model = llm_model
+        self.embed_model = embed_model
 
         # Postgre db 연결
         self.conn = psycopg2.connect(host=host, database=database, user=user, password=password, port=port)
         self.cur = self.conn.cursor()
+
+        # TF-IDF pickle 파일 로드
+        with open(tfidf_vectorizer_path, "rb") as f:
+            self.tfidf_vectorizer = pickle.load(f)
+
+        with open(svm_model_path, "rb") as f:
+            self.svm_model = pickle.load(f)
+
+        with open(label_encoder_path, "rb") as f:
+            self.label_encoder = pickle.load(f) 
         
         # Load nk_cities and build maps for normalization
         try:
@@ -189,7 +213,7 @@ class LLMtoDatabase:
         return ', '.join(sorted(list(final_results)))
 
     
-    def get_article_summary(self, title, contents, publish_date, model="gpt-4o-mini"):
+    def get_article_summary(self, title, contents, publish_date):
         """
         뉴스 기사를 LLM으로 요약하고 항목별 데이터 반환
         
@@ -249,7 +273,7 @@ class LLMtoDatabase:
 
         try:
             response = client.chat.completions.create(
-                model=model,
+                model=self.llm_model,
                 messages=[
                     {"role": "system", "content": "당신은 북한 관련 뉴스 사건 정보를 추출하는 전문 분석 모델입니다."},
                     {"role": "user", "content": prompt},
@@ -295,7 +319,7 @@ class LLMtoDatabase:
         # 그 외 타입은 문자열로 강제 변환
         return str(value)
     
-    def insert_summary(self, llm, title, publish_date, url):
+    def insert_summary(self, llm, title, publish_date, url, category, embedding):
         """
         
         LLM output 과 원본 csv 파일의 title, publish_date, url 데이터를 postgre table에 저장
@@ -305,14 +329,18 @@ class LLMtoDatabase:
         수정: 동일한 url이 재입력 시, pass 
         상세: query >> ON CONFLICT (url) DO NOTHING << 추가
 
+        [수정 2025-12-03]
+        categorizer, embedding model update
+        llm_to_db.ipynb 코드 병합.
+
         """
 
         query = """
             INSERT INTO summary
                 (summary, keywords, event_title, event_date,
-                 event_person, event_org, event_loc, url, title, publish_date)
+                 event_person, event_org, event_loc, url, title, publish_date, category, embedding)
             VALUES
-                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (url) DO NOTHING;
         """
 
@@ -327,6 +355,8 @@ class LLMtoDatabase:
             url,
             title, 
             publish_date,
+            category,
+            embedding.tolist(),
         )
 
         try:
@@ -361,6 +391,139 @@ class LLMtoDatabase:
 
         return count > 0
 
+    def preprocess_text(self, text):
+        """
+
+        [추가 2025-11-27]
+        issue: SVM 모델 구동 위해 형태 동일하게 변환.
+        해결: s_news_categorizer 전처리 코드와 동일한 로직.
+
+        """
+        if pd.isna(text): 
+            return ""
+        text = str(text).lower() 
+        text = re.sub(r'[^가-힣a-zA-Z0-9\s]', '', text) 
+        return text    
+
+    def get_category(self, summary, keywords):
+        """
+
+        [추가 2025-11-27]
+        issue: 모델 분류기가 tf-idf를 활용함에 따라 tf-idf 변환 필요.
+        해결: s_news_categorizer 전처리 코드 merge.
+        상세: s_news_categorizer.ipynb 동일. 
+        
+        [수정 2025-11-28]
+        summary + keywords 를 input을 받는 vectorizer 로 변경.
+        vectorizer >> svm >> label encoding
+
+        """
+        preprocessed_summary = self.preprocess_text(summary)
+        preprocessed_keywords = self.preprocess_text(keywords)
+        combined_text = preprocessed_summary + " " + preprocessed_keywords
+
+        X_combined = self.tfidf_vectorizer.transform([combined_text])
+
+        svm_pred = self.svm_model.predict(X_combined)[0]
+
+        category = self.label_encoder.inverse_transform([svm_pred])[0]
+        return category
+
+    def text_to_embedding(self, text):
+        """
+
+        [추가 2025-11-27]
+        issue: 모델 분류기는 tf-idf를 활용하지만, 추천시스템은 embedding 활용.
+        해결: embedding 코드 추가.
+        상세: summary + keywords 를 임베딩 후 수평합. 해당 값은 postgres에 저장.
+
+        [수정 2025-11-28]
+        issue: text_embedding 라이브러리와 파이썬 버전 충돌
+        해결: text_embeddings[0].embedding >> text_embeddings.data[0].embedding
+
+        """
+        text = text
+        text_embeddings = client.embeddings.create(
+            model = self.embed_model,
+            input = text
+        )
+        embeddings = np.array(text_embeddings.data[0].embedding, dtype = np.float32)
+        return embeddings
+
+    def get_embeddings(self, summary, keywords):
+        """
+
+        [추가 2025-11-27]
+        issue: 모델 분류기는 tf-idf를 활용하지만, 추천시스템은 embedding 활용.
+        해결: embedding 코드 추가.
+        상세: text_to_embedding 함수 받아와 summary, keywords 임베딩.
+
+        """
+        embed_summary = self.text_to_embedding(summary)
+        embed_keywords = self.text_to_embedding(keywords)
+        embed_rec = np.hstack([embed_summary, embed_keywords])
+        return embed_rec
+
     def close(self):
         self.cur.close()
         self.conn.close()
+
+
+
+"""
+실행 코드
+
+df = pd.read_csv("{파일path입력}", encoding="cp949")  
+# 반드시 포함: title, contents, publish_date, url
+
+llm_db = LLMtoDatabase(
+    host="localhost",
+    database="nvisiaDb",
+    user="postgres",
+    password="postgres1202",
+    port=5432,
+    tfidf_vectorizer_path = "pickle/s_news_cate_tfidf_xcombined_vec.pkl", 
+    svm_model_path = "pickle/s_news_cate_model.pkl", 
+    label_encoder_path = "pickle/s_news_cate_label_en.pkl"
+)
+# 피클 파일 경로 주의
+
+for idx, row in df.iterrows():
+    title = str(row["title"])
+    contents = str(row["contents"])
+    publish_date = str(row["publish_date"])
+    url = str(row["url"])
+
+    if llm_db.check_url(url):
+        print(f"[중복] 이미 존재하는 기사입니다. 이어서 다음 기사를 분석합니다.")
+        continue
+
+    # LLM 
+    llm_output = llm_db.get_article_summary(title, contents, publish_date)
+
+    if llm_output is None:
+        print(f"[에러] 데이터가 누락되어 다음 행으로 넘어갑니다. {idx}")
+        continue
+
+    # event_loc 정규화
+    raw_loc = llm_output.get("event_loc")
+    norm_loc = llm_db.map_location_normalized(raw_loc)
+    llm_output["event_loc"] = norm_loc 
+
+    # category 분류
+    summary_text = llm_output.get("summary")
+    keywords_text = llm_output.get("keywords")
+    category = llm_db.get_category(summary_text, keywords_text)
+
+    # embedding
+    embedding = llm_db.get_embeddings(summary_text, keywords_text)
+
+    # DB 저장
+    llm_db.insert_summary(llm_output, title, publish_date, url, category, embedding)
+
+    print(f"[저장] 행 업로드 되었습니다. {idx}")
+
+llm_db.close()
+print("[종료] 모든 업로드가 완료되었습니다.")
+
+"""
