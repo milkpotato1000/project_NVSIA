@@ -1,5 +1,5 @@
 import pandas as pd
-from LLMtoDatabase import LLMtoDatabase
+from project_NVSIA.test_python_files.LLMtoDatabase import LLMtoDatabase
 
 df = pd.read_csv("data/test_region_parsing.csv", encoding="cp949")
 
