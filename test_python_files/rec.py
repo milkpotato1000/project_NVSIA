@@ -14,6 +14,10 @@ class Recommender:
 
         실행 방법은 rec.ipynb 파일 참고.
 
+        [수정 2025-12-05]
+        issue: knowledge graph 표현 위해서는 Recommender의 출력값에 keywords도 필요
+        solve: 출력 result에 keywords 추가
+
         """
 
         # Postgre db 연결
@@ -42,6 +46,7 @@ class Recommender:
             )
             SELECT
                 s.id,
+                s.keywords,
                 s.category,
                 s.publish_date,
                 s.title,
@@ -62,6 +67,7 @@ class Recommender:
             results.append(
                 {
                     "id": row["id"],
+                    "keywords": row["keywords"],
                     "category": row["category"],
                     "publish_date": str(row["publish_date"])[:10],
                     "title": row["title"],
