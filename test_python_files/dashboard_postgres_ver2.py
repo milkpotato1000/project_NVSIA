@@ -38,8 +38,14 @@ dashboard.py 내용 수정. postgres 연동 목적.
 geocoder 통해 사용자가 클릭한 기사의 event_loc을 지도에 표시(추천 기사의 event_loc은 표시하지 않음).
 Recommender, Geocoder 에서 모두 활용할 selected_id 객체 생성하였음.
 
+[수정 2025-12-08]
+issue: 지도 출력 event 무한 호출.
+solve: 
+
 """
 
+# ========================= #
+# DB 설정
 # ========================= #
 DB = dict(
     host="localhost",
@@ -49,30 +55,24 @@ DB = dict(
     port=5432,
 )
 
-@st.cache_resource
-def get_rec():
-    return Recommender(**DB)
-
-@st.cache_resource
-def get_geo():
-    return Geocoder(**DB)
-
-rec = get_rec()
-geo = get_geo()
 # ========================= #
-
-
-# Matplotlib 한글 폰트 설정 (Windows)
-plt.rc('font', family='Malgun Gothic')
-plt.rc('axes', unicode_minus=False)
-
-st.set_page_config(page_title="News Data Dashboard", layout="wide")
-
-st.title("NVISIA: North-Korea Vision & Insights by SIA")
+# 공용 커넥터 / 헬퍼
+# ========================= #
+def get_psql_conn():
+    """간단 쿼리용 psycopg2 커넥션 (글로벌 캐시 X, 매번 열고 닫기)"""
+    conn = psycopg2.connect(
+        host=DB["host"],
+        database=DB["database"],
+        user=DB["user"],
+        password=DB["password"],
+        port=DB["port"],
+        options="-c client_encoding=UTF8 -c lc_messages=C",
+    )
+    return conn
 
 @st.cache_data
 def load_all_articles():
-    conn = psycopg2.connect(**DB)
+    conn = get_psql_conn()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("""
         SELECT
@@ -89,9 +89,46 @@ def load_all_articles():
     rows = cur.fetchall()
     cur.close()
     conn.close()
-    return pd.DataFrame(rows)
 
+    df = pd.DataFrame(rows)
+
+    return df
+
+# ========================= #
+# Streamlit 세팅
+# ========================= #
+st.set_page_config(page_title="News Data Dashboard", layout="wide")
+st.title("NVISIA: North-Korea Vision & Insights by SIA")
+
+if "geo" not in st.session_state:
+    st.session_state["geo"] = Geocoder(**DB)
+if "rec" not in st.session_state:
+    st.session_state["rec"] = Recommender(**DB)
+
+geo: Geocoder = st.session_state["geo"]
+rec: Recommender = st.session_state["rec"]
+
+# 클릭된 기사 id / loc 저장
+if "selected_id" not in st.session_state:
+    st.session_state["selected_id"] = None
+    
+if "selected_loc" not in st.session_state:
+    st.session_state["selected_loc"] = None
+
+# 추천결과 캐싱
+if "rec_df" not in st.session_state:
+    st.session_state["rec_df"] = None
+
+# ========================= #
+# 기타 세팅
+# ========================= #
+# Matplotlib 한글 폰트 설정 (Windows)
+plt.rc('font', family='Malgun Gothic')
+plt.rc('axes', unicode_minus=False)
+
+# =========================
 # 데이터 로드
+# =========================
 df = load_all_articles()
 
 # publish_date 기준 내림차순 정렬 (최신 날짜가 먼저)
@@ -100,156 +137,164 @@ if not df.empty and 'publish_date' in df.columns:
 
 if df.empty:
     st.warning("No data to display.")
-else:
+    st.stop()
 
-    # 확장 상태 초기화
-    if "expanded" not in st.session_state:
-        st.session_state.expanded = False
-    if "selected_id" not in st.session_state:
-        st.session_state.selected_id = None
-    if "map_obj" not in st.session_state:
-        st.session_state.map_obj = None
-    if "rec_df" not in st.session_state:
-        st.session_state.rec_df = None
+# =========================
+# 레이아웃: 상단
+# =========================
+top_left, top_right = st.columns([1, 2])
 
-    # 상단 섹션을 위한 1:2 비율 컬럼 생성
-    col1, col2 = st.columns([1, 2])
+# 동적 콘텐츠를 위한 플레이스홀더
+with top_left:
+    chart_container = st.empty()
 
-    # 동적 콘텐츠를 위한 플레이스홀더
-    with col1:
-        chart_container = st.empty()
+with top_right:
+    rec_container = st.empty()
 
-    with col2:
-        rec_container = st.empty()
+st.divider()
 
-    st.divider()
 
-    # 확장 토글 버튼
-    def toggle_expanded():
-        st.session_state.expanded = not st.session_state.expanded
+# =========================
+# 레이아웃: 하단 
+# =========================
 
-    st.button(
-        "Expand table" if not st.session_state.expanded else "Collapse table",
-        on_click=toggle_expanded
+if "expanded" not in st.session_state:
+    st.session_state.expanded = False
+
+def toggle_expanded():
+    st.session_state.expanded = not st.session_state.expanded
+
+st.button(
+    "Expand table" if not st.session_state.expanded else "Collapse table",
+    on_click=toggle_expanded,
+)    
+
+# 높이 결정
+table_height = 600 if st.session_state.expanded else 250
+
+# 레이아웃 생성: 왼쪽은 데이터프레임, 오른쪽은 지도
+bottom_left, bottom_right = st.columns([2, 1])
+
+# =========================
+# 레이아웃: 하단 좌측 테이블
+# =========================
+with bottom_left:
+    # 스크롤 가능한 컨테이너에 전체 데이터프레임 표시
+    display_columns = ["id", "title", "summary", "publish_date", "category"]
+    # 데이터프레임에 존재하는 컬럼만 포함
+    display_columns = [c for c in display_columns if c in df.columns]
+
+    event = st.dataframe(
+        df[display_columns],
+        height=table_height,
+        width="stretch",
+        selection_mode="single-row",
+        on_select="rerun",
+        key="news_table",
     )
-    
-    # 높이 결정
-    table_height = 600 if st.session_state.expanded else 250
+    st.caption(f"Showing {len(df)} rows – scroll to view the rest.")
 
-    # 레이아웃 생성: 왼쪽은 데이터프레임, 오른쪽은 지도
-    df_col, map_col = st.columns([2, 1])
+    selected_rows = event["selection"]["rows"]
 
-    with df_col:
-        # 스크롤 가능한 컨테이너에 전체 데이터프레임 표시
-        # 행 선택 활성화
-        display_columns = ['id', 'title', 'summary', 'publish_date', 'category']
+    # Recommender, Geocoder 에서 모두 활용할 기사 id 를 받는 변수 생성.
+    new_id = None
+    new_loc = None
 
-        # 데이터프레임에 존재하는 컬럼만 포함
-        display_columns = [col for col in display_columns if col in df.columns]
+    if selected_rows:
+        idx = selected_rows[0]
+        new_id = df.iloc[idx]["id"]
+        new_loc = df.iloc[idx]["event_loc"]
 
-        event = st.dataframe(
-            df[display_columns], 
-            height=table_height, 
-            use_container_width=True, 
-            on_select="rerun", 
-            selection_mode="single-row"
-        )
-        st.caption(f"Showing {len(df)} rows – scroll to view the rest.")
+    prev_id = st.session_state["selected_id"]
 
-    # rerun에서 사용자가 선택한 id (streamlit 무한 호출로 인해 코드 수정)
-    current_selected_id = None
+    # 클릭한 기사가 바뀐 경우에만 다시 계산
+    if new_id != prev_id:
+        st.session_state["selected_id"] = new_id
+        st.session_state["selected_loc"] = new_loc
 
-    if len(event.selection.rows) > 0:
-        selected_idx = event.selection.rows[0]
-        current_selected_id = df.iloc[selected_idx]["id"]
-
-    # 선택이 바뀐 경우에만 DB 호출
-    if current_selected_id is not None and current_selected_id != st.session_state.selected_id:
-        st.session_state.selected_id = current_selected_id
-
-        if current_selected_id is not None:
-            # 지도 새로 생성
-            st.session_state.map_obj = geo.get_map_single(current_selected_id)
-
-            # 추천 기사 새로 조회
-            rec_list = rec.get_similar_articles(current_selected_id, k=10)
+        if new_id is not None:
+            # 추천 새로 계산
+            rec_list = rec.get_similar_articles(new_id, k=10)
             rec_df = pd.DataFrame(rec_list)
             if not rec_df.empty:
-                rec_df = rec_df.merge(
-                    df[['id', 'summary']],
-                    on='id',
-                    how='left'
-                )
-            st.session_state.rec_df = rec_df
-
-    with map_col:
-        if st.session_state.map_obj is not None:
-            st_folium(st.session_state.map_obj, width=300, height=400, key="map")
+                rec_df = rec_df.merge(df[["id", "summary"]], on="id", how="left")
+            st.session_state["rec_df"] = rec_df
         else:
-            st.info("위치를 조회하고자 하는 기사를 선택해주세요.")
+            st.session_state["rec_df"] = None
 
-    # 차트(col1)에 사용할 데이터 결정 및 col2 업데이트
-    if st.session_state.selected_id is not None and st.session_state.rec_df is not None:
-        rec_df = st.session_state.rec_df
-        chart_df = rec_df
-        chart_title = "추천 뉴스 카테고리"
-        
-        # col2에 추천 데이터 테이블 표시
-        with rec_container.container():
-            st.subheader(f"관련 추천 뉴스 (기준: {st.session_state.selected_id})")
-            if not rec_df.empty:
-                # 긴 텍스트 축약을 위한 복사본 생성
-                cols_for_display = ['id', 'title', 'summary', 'category', 'publish_date']
-                cols_for_display = [c for c in cols_for_display if c in rec_df.columns]
-                display_df = rec_df[cols_for_display].copy()
+selected_id = st.session_state["selected_id"]
+selected_loc = st.session_state["selected_loc"]
+rec_df = st.session_state["rec_df"]
 
-                if 'summary' in display_df.columns:
-                    display_df['summary'] = display_df['summary'].apply(lambda x: x[:50] + '...' if isinstance(x, str) and len(x) > 50 else x)
-                    
-                # 정렬 가능한 컬럼을 위해 st.dataframe 사용
-                st.dataframe(
-                    display_df,
-                    use_container_width=True,
-                    hide_index=True,
-                    height=300
-                )
-            else:
-                st.info("No recommended data available.")
+# =========================
+# 레이아웃: 하단 우측 지도
+# =========================
+with bottom_right:
+    if selected_id is not None:
+        m = geo.get_map_single(selected_id)
+        st_folium(m, width=300, height=400)
     else:
-        # 선택된 행 없음: 전체 데이터를 차트에 사용
-        chart_df = df
-        chart_title = "전체 뉴스 카테고리"
-        
-        # col2에 안내 메시지 표시
-        with rec_container.container():
-            st.info("아래 목록에서 기사를 선택하면 추천 뉴스가 표시됩니다.")
+        st.info("위치를 조회하고자 하는 기사를 선택해주세요.")
 
-    # col1에 파이 차트 그리기
-    with chart_container.container():
-        if 'category' in chart_df.columns:
-            st.subheader(chart_title)
-            category_counts = chart_df['category'].value_counts()
-            
-            if not category_counts.empty:
-                def autopct_filter(pct):
-                    return ('%1.1f%%' % pct) if pct > 5 else ''
-                    
-                # 작은 크기
-                fig, ax = plt.subplots(figsize=(1.7, 1.7)) 
-                # 레이블 바깥쪽, 회전 없음
-                wedges, texts, autotexts = ax.pie(
-                    category_counts, 
-                    labels=category_counts.index, 
-                    autopct=autopct_filter, 
-                    startangle=90, 
-                    textprops={'fontsize': 4}
-                )
-                
-                # 파이 내부 퍼센트 글자 크기 작게
-                for autotext in autotexts:
-                    autotext.set_fontsize(4)
-                    
-                ax.axis('equal')
-                st.pyplot(fig, use_container_width=False)
-            else:
-                st.info("No category data to display.")
+
+# ========================= #
+# 레이아웃: 상단 우측 추천 뉴스
+# ========================= #
+if rec_df is not None and not rec_df.empty:
+    chart_df = rec_df
+    chart_title = "추천 뉴스 카테고리"
+
+    with rec_container.container():
+        st.subheader(f"관련 추천 뉴스 (기준: {selected_id})")
+
+        cols = ["id", "title", "summary", "category", "publish_date"]
+        cols = [c for c in cols if c in rec_df.columns]
+
+        # 긴 텍스트 축약을 위한 복사본 생성
+        display_df = rec_df[cols].copy()
+        if "summary" in display_df.columns:
+            display_df["summary"] = display_df["summary"].apply(
+                lambda x: x[:50] + "..." if isinstance(x, str) and len(x) > 50 else x
+            )
+
+        # 정렬 가능한 컬럼을 위해 st.dataframe 사용
+        st.dataframe(
+            display_df, 
+            width="stretch", 
+            hide_index=True, 
+            height=300
+        )
+
+else:
+    # 선택된 행 없음: 전체 데이터를 차트에 사용
+    chart_df = df
+    chart_title = "전체 뉴스 카테고리"
+    rec_container.info("아래 목록에서 기사를 선택하면 추천 뉴스가 표시됩니다.")
+
+# ========================= #
+# 레이아웃: 상단 좌측 파이차트
+# ========================= #
+
+with chart_container.container():
+    if "category" in chart_df.columns:
+        st.subheader(chart_title)
+        category_counts = chart_df["category"].value_counts()
+
+        if not category_counts.empty:
+            def autopct_filter(pct):
+                return "%1.1f%%" % pct if pct > 5 else ""
+
+            fig, ax = plt.subplots(figsize=(1.7, 1.7))
+            wedges, texts, autotexts = ax.pie(
+                category_counts,
+                labels=category_counts.index,
+                autopct=autopct_filter,
+                startangle=90,
+                textprops={"fontsize": 4},
+            )
+            for autotext in autotexts:
+                autotext.set_fontsize(4)
+            ax.axis("equal")
+            st.pyplot(fig)
+        else:
+            st.info("No category data to display.")
