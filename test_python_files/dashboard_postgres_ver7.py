@@ -1,0 +1,327 @@
+import numpy as np
+import pandas as pd
+
+import streamlit as st
+from streamlit_folium import st_folium
+import matplotlib.pyplot as plt
+
+from rec import Recommender
+from geocoder import Geocoder
+import folium
+import hashlib
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+
+# =========================
+# DB 설정
+# =========================
+DB = dict(
+    host="localhost",
+    database="nvisiaDb",
+    user="postgres",
+    password="postgres1202",
+    port=5432,
+)
+
+
+# =========================
+# 공용 커넥터 / 헬퍼
+# =========================
+def get_psql_conn():
+    """간단 쿼리용 psycopg2 커넥션 (글로벌 캐시 X, 매번 열고 닫기)"""
+    conn = psycopg2.connect(
+        host=DB["host"],
+        database=DB["database"],
+        user=DB["user"],
+        password=DB["password"],
+        port=DB["port"],
+        options="-c client_encoding=UTF8 -c lc_messages=C",
+    )
+    return conn
+
+
+@st.cache_data(show_spinner=False)
+def load_all_articles() -> pd.DataFrame:
+    """전체 기사 목록 로드 (id 기준 내림차순)"""
+    conn = get_psql_conn()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute(
+        """
+        SELECT
+            id,
+            title,
+            summary,
+            publish_date,
+            category,
+            event_loc,
+            url
+        FROM spnews_summary
+        ORDER BY id DESC
+        """
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    df = pd.DataFrame(rows)
+    if "publish_date" in df.columns:
+        df["publish_date"] = df["publish_date"].astype(str).str[:10]
+    return df
+
+
+def split_event_locs(event_loc_str: str):
+    """'평양시, 함경북도 청진시' → ['평양시', '함경북도 청진시']"""
+    if not event_loc_str:
+        return []
+    return [p.strip() for p in event_loc_str.split(",") if p.strip()]
+
+
+# =========================
+# Streamlit 세팅
+# =========================
+st.set_page_config(page_title="News Data Dashboard", layout="wide")
+st.title("NVISIA: North-Korea Vision & Insights by SIA")
+
+# Matplotlib 한글 폰트
+plt.rc('font', family='Malgun Gothic')
+plt.rc('axes', unicode_minus=False)
+
+# =========================
+# 객체 호출
+# =========================
+@st.cache_resource
+def get_rec():
+    return Recommender(**DB)
+
+@st.cache_resource
+def get_geo():
+    return Geocoder(**DB)
+
+rec = get_rec()
+geo = get_geo()
+
+if "selected_id" not in st.session_state:
+    st.session_state["selected_id"] = None
+
+if "expanded" not in st.session_state:
+    st.session_state.expanded = False
+
+# =========================
+# 데이터 로드
+# =========================
+df = load_all_articles()
+
+# =========================
+# 레이아웃
+#   top_left  : 파이차트
+#   top_right : 추천 기사 테이블
+#   bottom_left : 전체 기사 테이블
+#   bottom_right: 지도
+# =========================
+top_left, top_right = st.columns([1, 2])
+
+st.divider()
+
+def toggle_expanded():
+    st.session_state.expanded = not st.session_state.expanded
+
+st.button(
+    "기사 더보기" if not st.session_state.expanded else "되돌리기",
+    on_click=toggle_expanded,
+)
+
+table_height = 600 if st.session_state.expanded else 250
+
+bottom_left, bottom_right = st.columns([2, 1])
+
+# =========================
+# bottom_left: 전체 기사 목록
+# =========================
+with bottom_left:
+    st.subheader("전체 기사 목록")
+
+    df_display = df[['id', 'title', 'summary', 'publish_date', 'category']].copy()
+    st.caption(f"총 {len(df_display)}개 기사 - 더 많은 기사를 보려면 스크롤하세요.")
+
+    id_options = df_display["id"].tolist()
+    if id_options:
+        if st.session_state["selected_id"] in id_options:
+            default_index = id_options.index(st.session_state["selected_id"])
+        else:
+            default_index = 0
+
+        selected_id = st.selectbox(
+            "추천 및 지도를 표시할 기사 선택",
+            options=id_options,
+            index=default_index,
+            key="select_id_box",
+        )
+        st.session_state["selected_id"] = selected_id
+    else:
+        st.warning("표시할 기사가 없습니다.")
+        selected_id = None
+
+    st.dataframe(
+        df_display,
+        width="stretch",
+        height=table_height,
+    )
+
+selected_id = st.session_state["selected_id"]
+
+# =========================
+# top: 추천 기사 테이블 + 파이차트 세팅
+# =========================
+rec_list = []
+rec_ids = []
+rec_df_view = pd.DataFrame()
+
+chart_df = df.copy()
+chart_title = "전체 뉴스 카테고리"
+
+if selected_id is not None:
+    rec_list = rec.get_similar_articles(selected_id, k=10)
+    rec_ids = [r["id"] for r in rec_list]
+
+    if rec_list:
+        df_rec = df[df["id"].isin(rec_ids)].copy()
+        df_rec.set_index("id", inplace=True)
+
+        rows = []
+        for r in rec_list:
+            rid = r["id"]
+            base = df_rec.loc[rid] if rid in df_rec.index else {}
+
+            title = base.get("title", r.get("title", ""))
+            summary = (base.get("summary", "") or "")[:50]
+            category = base.get("category", r.get("category", ""))
+            publish_date = base.get("publish_date", r.get("publish_date", ""))
+
+            rows.append(
+                {
+                    "id": rid,
+                    "title": title + ("..." if len(title) == 80 else ""),
+                    "summary": summary + ("..." if len(summary) == 50 else ""),
+                    "category": category,
+                    "publish_date": publish_date,
+                }
+            )
+
+        rec_df_view = pd.DataFrame(rows)
+
+        if not rec_df_view.empty:
+            chart_df = rec_df_view
+            chart_title = "추천 뉴스 카테고리"
+
+# =========================
+# top_right: 추천 기사 테이블
+# =========================
+with top_right:
+    if selected_id is not None:
+        st.subheader(f"관련 추천 뉴스 (기준: {selected_id})")
+    else:
+        st.subheader("관련 추천 뉴스")
+
+    if not rec_df_view.empty:
+        st.dataframe(
+            rec_df_view[['id', 'title', 'summary', 'category', 'publish_date']],
+            width="stretch",
+            hide_index=True,
+            height=300,
+        )
+    else:
+        if selected_id is None:
+            st.info("아래 목록에서 기사를 선택하면 추천 뉴스가 표시됩니다.")
+        else:
+            st.info("추천 기사가 없습니다.")
+
+# =========================
+# top_left: 파이차트
+# =========================
+with top_left:
+    if "category" in chart_df.columns:
+        st.subheader(chart_title)
+        category_counts = chart_df["category"].value_counts()
+
+        if not category_counts.empty:
+            def autopct_filter(pct):
+                return ('%1.1f%%' % pct) if pct > 5 else ''
+
+            fig, ax = plt.subplots(figsize=(1.7, 1.7)) 
+            # 레이블 바깥쪽, 회전 없음
+            wedges, texts, autotexts = ax.pie(
+                category_counts,
+                labels=category_counts.index,
+                autopct=autopct_filter,
+                startangle=90,
+                textprops={'fontsize': 4}
+            )
+
+            # 파이 내부 퍼센트 글자 크기 작게
+            for autotext in autotexts:
+                autotext.set_fontsize(4)
+
+            ax.axis("equal")
+            st.pyplot(fig, width='content')
+        else:
+            st.info("입력된 데이터가 없습니다. 데이터를 추가해주세요.")
+    else:
+        st.info("카테고리 로드 중 오류가 발생했습니다.")
+
+# =========================
+# bottom_right: 지도
+# =========================
+with bottom_right:
+
+    if selected_id:
+        df_sel = df[df["id"] == selected_id].copy()
+
+        locs = set()
+        for loc_str in df_sel["event_loc"].fillna(""):
+            for loc in split_event_locs(loc_str):
+                locs.add(loc)
+        locs = sorted(locs)
+
+        if locs:
+            geo_dict = geo.get_geometry(locs)
+
+            center = (39.0, 127.0)
+            m = folium.Map(location=center, zoom_start=7)
+
+            def color_from_name(name):
+                h = hashlib.md5(name.encode("utf-8")).hexdigest()[:6]
+                return f"#{h}"
+
+            for loc, geom in geo_dict.items():
+                feature = {
+                    "type": "Feature",
+                    "geometry": geom,
+                    "properties": {
+                        "event_loc": loc,
+                    },
+                }
+
+                folium.GeoJson(
+                    feature,
+                    name=loc,
+                    tooltip=folium.Tooltip(loc),
+                    style_function=lambda x, loc_name=loc: {
+                        "fillColor": color_from_name(loc_name),
+                        "color": "black",
+                        "weight": 1,
+                        "fillOpacity": 0.6,
+                    },
+                    highlight_function=lambda x: {
+                        "weight": 3,
+                        "color": "yellow",
+                        "fillOpacity": 0.8,
+                    },
+                ).add_to(m)
+
+            st_folium(m, width=350, height=350)
+        else:
+            st.info("선택된 기사에 위치 정보가 없습니다.")
+    else:
+        st.info("위치를 조회하고자 하는 기사를 선택해주세요.")
