@@ -49,7 +49,10 @@ solve: knowledge.py 연동
 [수정 2025-12-11]
 issue: KG2개 뉴스에 포함되는 키워드만 표시 / 추천 뉴스 상단 클릭한 뉴스 표시
 solve: knowledge.py 수정 / 코드 수정
-detail: knowledge graph 버전 업데이트(knowledge_ver3.py)
+detail: 
+    - knowledge graph 버전 업데이트(knowledge_ver3.py)
+    - 토글: "기사 더보기" >> "기사 목록 펼치기"
+    - 클릭된 기사 재클릭하여 취소 시, 초기화면으로 복귀
 
 """
 
@@ -165,7 +168,7 @@ def toggle_expanded():
     st.session_state.expanded = not st.session_state.expanded
 
 st.button(
-    "기사 더보기" if not st.session_state.expanded else "되돌리기",
+    "기사 목록 펼치기" if not st.session_state.expanded else "되돌리기",
     on_click=toggle_expanded,
 )
 
@@ -195,6 +198,9 @@ with bottom_left:
     if event.selection.rows:
         idx = event.selection.rows[0]
         st.session_state["selected_id"] = df_display.iloc[idx]["id"]
+
+    else:
+        st.session_state["selected_id"] = None
 
 selected_id = st.session_state.get("selected_id")
 
@@ -324,30 +330,30 @@ with top_left:
 
         if not category_counts.empty:
 
-            # left_spacer, center_col, right_spacer = st.columns([1, 3, 1])
+            left_spacer, center_col, right_spacer = st.columns([1, 3, 1])
 
-            # # 파이차트 가운데 위치
-            # with center_col:
+            # 파이차트 가운데 위치
+            with center_col:
 
-            def autopct_filter(pct):
-                return ('%1.1f%%' % pct) if pct > 5 else ''
-            
-            fig, ax = plt.subplots(figsize=(1.7, 1.7))
-            # 레이블 바깥쪽, 회전 없음
-            wedges, texts, autotexts = ax.pie(
-                category_counts,
-                labels=category_counts.index,
-                autopct=autopct_filter,
-                startangle=90,
-                textprops={"fontsize": 4},
-            )               
+                def autopct_filter(pct):
+                    return ('%1.1f%%' % pct) if pct > 5 else ''
+                
+                fig, ax = plt.subplots(figsize=(1.7, 1.7))
+                # 레이블 바깥쪽, 회전 없음
+                wedges, texts, autotexts = ax.pie(
+                    category_counts,
+                    labels=category_counts.index,
+                    autopct=autopct_filter,
+                    startangle=90,
+                    textprops={"fontsize": 4},
+                )               
 
-            # 파이 내부 퍼센트 글자 크기 작게
-            for autotext in autotexts:
-                autotext.set_fontsize(4)
+                # 파이 내부 퍼센트 글자 크기 작게
+                for autotext in autotexts:
+                    autotext.set_fontsize(4)
 
-            ax.axis("equal")
-            st.pyplot(fig, width="content")
+                ax.axis("equal")
+                st.pyplot(fig, width="content")
         else:
             st.info("입력된 데이터가 없습니다. 데이터를 추가해주세요.")
     else:
